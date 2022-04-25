@@ -1,8 +1,0 @@
-{
-  "profiles": {
-    "tibberToInfluxDB": {
-      "commandName": "Project",
-      "commandLineArgs": "ZjmVXKgfe96NJfrHSZTaodKonVgvyg7LFUczjXcBWkw http://10.0.0.6:8086 energy monuser Redhat@123 --LOADHISTORICAL_ --Logging normal --INSERTBLOCKSIZE 10 --RETENTIONPOLICY rp_archive"
-    }
-  }
-}
