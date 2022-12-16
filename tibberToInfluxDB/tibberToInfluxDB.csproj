@@ -7,5 +7,9 @@
 
   <ItemGroup>
     <PackageReference Include="Newtonsoft.Json" Version="13.0.1" />
+    <PackageReference Include="Tibber.Sdk" Version="0.5.0-beta" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Remove="Tibber.Sdk" />
   </ItemGroup>
 </Project>

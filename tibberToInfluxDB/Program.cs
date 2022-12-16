@@ -1,14 +1,19 @@
 ﻿using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Net;
+using System.Net.Http.Headers;
 using System.Net.Mime;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Web;
+using Tibber.Sdk;
 
 namespace tibberToInfluxDB
 {
@@ -199,12 +204,24 @@ namespace tibberToInfluxDB
         /// <param name="args"></param>
         /// <returns></returns>
         private static string GetInfluxDBDatabaseURL(Settings settings, string submodule, List<KeyValuePair<string, string>> args)
+            => GetInfluxDBDatabaseURL(settings, settings.influxDBName, settings.influxDBRetentionPolicy, submodule, args);
+
+        /// <summary>
+        /// Adds 'db' as a argument to a influx url
+        /// </summary>
+        /// <param name="settings"></param>
+        /// <param name="influxDBName"></param>
+        /// <param name="influxDBRetentionPolicy"></param>
+        /// <param name="submodule"></param>
+        /// <param name="args"></param>
+        /// <returns></returns>
+        private static string GetInfluxDBDatabaseURL(Settings settings, string influxDBName, string influxDBRetentionPolicy, string submodule, List<KeyValuePair<string, string>> args, string precision = "h")
         {
             Helper.AddOrInitialize(ref args, new KeyValuePair<string, string>("db", settings.influxDBName));
-            args.Add(new KeyValuePair<string, string>("precision", "h"));
+            args.Add(new KeyValuePair<string, string>("precision", precision));
 
-            if (!string.IsNullOrWhiteSpace(settings.influxDBRetentionPolicy))
-                args.Add(new KeyValuePair<string, string>("rp", settings.influxDBRetentionPolicy));
+            if (!string.IsNullOrWhiteSpace(influxDBRetentionPolicy))
+                args.Add(new KeyValuePair<string, string>("rp", influxDBRetentionPolicy));
 
             return GetInfluxDBBaseURL(settings, submodule, args);
         }
@@ -273,6 +290,129 @@ namespace tibberToInfluxDB
             return ret;
         }
 
+        private static void AddValue(List<string> list, string name, object value)
+        {
+            if (value == null)
+                return;
+
+            string str = string.Concat(name, "=", ToInfluxValueString(value));
+            list.Add(str);
+        }
+
+        internal class RealTimeMeasurementObserver : IObserver<RealTimeMeasurement>
+        {
+            private readonly Guid homeID;
+            private readonly Settings settings;
+            private readonly CancellationHelper continueWork;
+            private readonly string url;
+            private readonly ConcurrentQueue<RealTimeMeasurement> measurements = new ConcurrentQueue<RealTimeMeasurement>();
+
+            public RealTimeMeasurementObserver(Guid homeID, Settings settings, CancellationHelper continueWork)
+            {
+                this.homeID = homeID;
+                this.settings = settings;
+                this.continueWork = continueWork;
+                this.url = GetInfluxDBDatabaseURL(settings, settings.influxDBTableLiveMeasurements ?? settings.influxDBTable, settings.influxDBRetentionPolicyLiveMeasurements, "write", null, "s");
+
+                Thread t = new Thread(UploadData);
+                t.Start();
+            }
+
+            private void UploadData()
+            {
+                while (!continueWork.IsCanceled)
+                {
+                    try
+                    {
+                        if (measurements.Count == 0)
+                        {
+                            Thread.Sleep(100);
+                            continue;
+                        }
+
+                        AppendToLog(settings, LoggingLevel.Detailed, "Sending Real Time Measurement...");
+
+                        GetInfluxDBResponse(settings, continueWork, url, WebRequestMethods.Http.Post, stream =>
+                        {
+                            using (StreamWriter writer = new StreamWriter(stream, encoding: new UTF8Encoding(false, true), leaveOpen: true))
+                            {
+                                while (measurements.TryDequeue(out RealTimeMeasurement value))
+                                {
+                                    writer.Write(settings.influxDBTableLiveMeasurements ?? settings.influxDBTable);
+                                    writer.Write(",");
+                                    WriteDataValue(writer, "homeID", homeID, true);
+                                    writer.Write(' ');
+
+                                    List<string> fields = new List<string>();
+                                    AddValue(fields, "accumulatedConsumption", value.AccumulatedConsumption);
+                                    AddValue(fields, "accumulatedConsumptionLastHour", value.AccumulatedConsumptionLastHour);
+                                    AddValue(fields, "accumulatedCost", value.AccumulatedCost);
+                                    AddValue(fields, "accumulatedProduction", value.AccumulatedProduction);
+                                    AddValue(fields, "accumulatedProductionLastHour", value.AccumulatedProductionLastHour);
+                                    AddValue(fields, "accumulatedReward", value.AccumulatedReward);
+                                    AddValue(fields, "averagePower", value.AveragePower);
+                                    AddValue(fields, "currency", value.Currency);
+                                    AddValue(fields, "currentPhase1", value.CurrentPhase1);
+                                    AddValue(fields, "currentPhase2", value.CurrentPhase2);
+                                    AddValue(fields, "currentPhase3", value.CurrentPhase3);
+                                    AddValue(fields, "lastMeterConsumption", value.LastMeterConsumption);
+                                    AddValue(fields, "lastMeterProduction", value.LastMeterProduction);
+                                    AddValue(fields, "power", value.Power);
+                                    AddValue(fields, "powerFactor", value.PowerFactor);
+                                    AddValue(fields, "powerReactive", value.PowerReactive);
+                                    AddValue(fields, "signalStrength", value.SignalStrength);
+                                    AddValue(fields, "voltagePhase1", value.VoltagePhase1);
+                                    AddValue(fields, "voltagePhase2", value.VoltagePhase2);
+                                    AddValue(fields, "voltagePhase3", value.VoltagePhase3);
+                                    string ln = string.Join(',', fields);
+                                    writer.Write(ln);
+
+                                    writer.Write(' ');
+                                    TimeSpan ts = value.Timestamp.ToUniversalTime() - DateTime.UnixEpoch;
+                                    writer.Write((long)ts.TotalSeconds);
+                                    writer.Write('\n');
+                                }
+                            }
+
+                            AppendToLog(settings, LoggingLevel.Detailed, "Waiting for repsonse...");
+                        });
+
+                        AppendToLog(settings, LoggingLevel.Detailed, $"Wrote real time data to influx.");
+                    }
+                    catch (Exception ex)
+                    {
+                        AppendToLog(settings, LoggingLevel.Error, ex.ToString());
+                    }
+                }
+            }
+
+            public void OnCompleted() => AppendToLog(settings, LoggingLevel.Detailed, "Real time measurement stream has been terminated.");
+
+            public void OnError(Exception error) => AppendToLog(settings, LoggingLevel.Error, error.ToString());
+
+            public void OnNext(RealTimeMeasurement value)
+            {
+                AppendToLog(settings, LoggingLevel.Detailed, "Received reltime data.");
+
+                measurements.Enqueue(value);
+            }
+        }
+
+        private static void SubscribeToLiveData(Settings settings, CancellationHelper continueWork)
+        {
+            if (settings.tibberLiveMeasurementsHomeIDs == null || settings.tibberLiveMeasurementsHomeIDs.Count == 0)
+                return;
+
+            ProductInfoHeaderValue userAgent = new ProductInfoHeaderValue("tibberflux", "0.0.1");
+            TibberApiClient client = new TibberApiClient(settings.tibberAPItoken, userAgent);
+
+            foreach (Guid homeID in settings.tibberLiveMeasurementsHomeIDs)
+            {
+                IObservable<RealTimeMeasurement> listener = client.StartRealTimeMeasurementListener(homeID, cancellationToken: continueWork.CancellationToken).Result;
+                listener.Subscribe(new RealTimeMeasurementObserver(homeID, settings, continueWork));
+            }
+        }
+
         /// <summary>
         /// Main entry
         /// </summary>
@@ -292,7 +432,7 @@ namespace tibberToInfluxDB
 
             Settings settings = settingsN.Value;
 
-            ///for using ctrl+c
+            //for using ctrl+c
             CancellationHelper continueWork = new CancellationHelper();
             Console.CancelKeyPress += (s, e) =>
             {
@@ -305,6 +445,8 @@ namespace tibberToInfluxDB
 
                 e.Cancel = true;
             };
+
+            SubscribeToLiveData(settings, continueWork);
 
             //main loop body
             while (continueWork)
@@ -396,6 +538,7 @@ namespace tibberToInfluxDB
             Settings ret = new Settings
             {
                 influxDBTable = "tibberflux",
+                influxDBTableLiveMeasurements = "tibberfluxlive",
                 influxDBInsertBlockSize = 10,
                 loggingLevel = LoggingLevel.Normal
             };
@@ -425,6 +568,12 @@ namespace tibberToInfluxDB
                     case "--TABLE":
                         if (args.TryGet(++i, out ret.influxDBTable))
                             ret.influxDBTable = ret.influxDBTable.Trim();
+                        break;
+
+                    //table for real time data
+                    case "--TABLERT":
+                        if (args.TryGet(++i, out ret.influxDBTableLiveMeasurements))
+                            ret.influxDBTableLiveMeasurements = ret.influxDBTableLiveMeasurements.Trim();
                         break;
 
                     //logging
@@ -474,6 +623,25 @@ namespace tibberToInfluxDB
                         args.TryGet(++i, out ret.influxDBRetentionPolicy);
                         break;
 
+                    //Retention Policy
+                    case "--RTHOMES":
+                        if (!args.TryGet(++i, out string homeguids))
+                            break;
+
+                        ret.tibberLiveMeasurementsHomeIDs = new List<Guid>();
+                        foreach (string guidstr in homeguids.Split(',', StringSplitOptions.None))
+                        {
+                            if (Guid.TryParse(guidstr, out Guid homeid))
+                                ret.tibberLiveMeasurementsHomeIDs.Add(homeid);
+                        }
+                        break;
+
+
+                    //Retention Policy
+                    case "--RETENTIONPOLICYRT":
+                        args.TryGet(++i, out ret.influxDBRetentionPolicyLiveMeasurements);
+                        break;
+
                     //fallback
                     default:
                         AppendToLog(ret, LoggingLevel.Error, $"Argument {args[i]} unknown!");
@@ -489,6 +657,9 @@ namespace tibberToInfluxDB
             Console.WriteLine("Arguments: <tibberAPIToken> <InfluxDBServer> <InfluxDBDatabase> <InfluxDBUser> <InfluxDBPassword>");
             Console.WriteLine();
             Console.WriteLine("--table: Target table for InfluxDB");
+            Console.WriteLine("--tablert: Target table for InfluxDB with RealTime Measurements");
+            Console.WriteLine("--rthomes: GUIDs of Homes for live measurements. Delimiter: ','");
+            Console.WriteLine("--retentionpolicyrt: GUIDs of Homes for live measurements. Delimiter: ','");
         }
 
         /// <summary>
@@ -747,14 +918,8 @@ namespace tibberToInfluxDB
             AppendToLog(settings, LoggingLevel.Normal, $"Inserted {totalNumberOfInsertions} new points to InfluxDB");
         }
 
-        private static void WriteDataValue(StreamWriter writer, string key, object value, bool isTag = false)
+        private static string ToInfluxValueString(object value, bool isTag = false)
         {
-            writer.Write(key);
-            writer.Write('=');
-
-            if (value == null)
-                return;
-
             bool doNotEscapeFirstAndLastChar = false;
 
             string str;
@@ -762,6 +927,8 @@ namespace tibberToInfluxDB
                 str = f.ToString(CultureInfo.InvariantCulture);
             else if (value is double d)
                 str = d.ToString(CultureInfo.InvariantCulture);
+            else if (value is decimal dc)
+                str = dc.ToString(CultureInfo.InvariantCulture);
             else
             {
                 str = value.ToString();
@@ -785,7 +952,21 @@ namespace tibberToInfluxDB
                 sb.Append(str[i]);
             }
 
-            writer.Write(sb.ToString());
+            return sb.ToString();
+        }
+
+        private static bool WriteDataValue(StreamWriter writer, string key, object value, bool isTag = false)
+        {
+            if (!isTag && value == null)
+                return false;
+
+            writer.Write(key);
+            writer.Write('=');
+
+            string str = ToInfluxValueString(value, isTag);
+            writer.Write(str);
+
+            return true;
         }
     }
 }
